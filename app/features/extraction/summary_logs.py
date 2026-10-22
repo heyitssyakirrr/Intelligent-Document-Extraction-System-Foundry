@@ -29,6 +29,10 @@ def _fmt_ms(value: int | None) -> str:
     return f"{value:,} ms" if value is not None else "-"
 
 
+def _fmt_count(value: int | None) -> str:
+    return f"{value:,}" if value is not None else "-"
+
+
 def _fmt_list(values: list[str]) -> str:
     return ", ".join(values) if values else "-"
 
@@ -102,6 +106,8 @@ def build_file_summary(ctx: FileProcessingContext) -> str:
         wall(f"  Parse Strategy : {ctx.llm_parse_strategy or '-'}"),
         wall(f"  JSON Objects   : {ctx.llm_json_objects_found if ctx.llm_json_objects_found is not None else '-'}"),
         wall(f"  Truncated      : {ctx.llm_response_truncated}"),
+        wall(f"  Finish Reason  : {ctx.llm_finish_reason or '-'}"),
+        wall(f"  Tokens         : prompt {_fmt_count(ctx.llm_prompt_tokens)} / completion {_fmt_count(ctx.llm_completion_tokens)}"),
         wall(f"  Fields Present : {_fmt_list(ctx.llm_keys_present)}"),
         wall(f"  Fields Missing : {_fmt_list(ctx.llm_keys_missing)}"),
         wall(f"  Last Error Type: {ctx.llm_last_error_type or '-'}"),

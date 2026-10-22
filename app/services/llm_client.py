@@ -5,9 +5,9 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 
 import httpx
-from fastapi import HTTPException
 
 from FileReader.app.core.config import get_settings
 
@@ -21,6 +21,30 @@ _EXPECTED_KEYS = {
     "bank_name",
 }
 
+# Statuses where the same request can succeed later (timeouts, rate limits,
+# gateway/model hiccups). Anything else (400 bad payload, 401/403 helper id,
+# 404 path, 413 too large) fails the same way every time.
+_RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
+
+
+class LLMError(Exception):
+    """A Foundry call that produced no usable fields. `retryable` tells the
+    pipeline whether another attempt can help; `retry_after` is the wait in
+    seconds the gateway asked for on a 429."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = True,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.status_code = status_code
+        self.retry_after = retry_after
+
 
 @dataclass
 class LLMExtractionMetadata:
@@ -32,6 +56,9 @@ class LLMExtractionMetadata:
     response_truncated: bool = False
     keys_present: list[str] | None = None
     keys_missing: list[str] | None = None
+    finish_reason: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
 
 
 def _strip_trailing_commas(text: str) -> str:
@@ -158,19 +185,73 @@ def _metadata_for_result(
     )
 
 
-def _normalize_llm_output(response_json: dict) -> tuple[dict, LLMExtractionMetadata]:
-    try:
-        if "choices" in response_json:
-            content = response_json["choices"][0]["message"].get("content")
-            if content is None:
-                logger.warning("LLM response has null content. Full response: %s", response_json)
-                raise ValueError("LLM returned null content in choices[0].message.content.")
-            raw = content.strip()
-        elif "text" in response_json:
-            raw = response_json["text"].strip()
-        else:
-            raise ValueError("Unexpected LLM response format: no 'choices' or 'text' key found.")
+def _flagged(results) -> list[str]:
+    """Category names Azure marked in a content_filter_results object, e.g.
+    {"jailbreak": {"filtered": true, "detected": true}, "hate": {"filtered": false, "severity": "safe"}}."""
+    if not isinstance(results, dict):
+        return []
+    return [
+        name for name, value in results.items()
+        if isinstance(value, dict) and (value.get("filtered") or value.get("detected"))
+    ]
 
+
+def _message_text(content) -> str:
+    """content is normally a string, but some deployments return a list of
+    parts - join their text."""
+    if isinstance(content, list):
+        content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return content.strip() if isinstance(content, str) else ""
+
+
+def _reply_text(body: dict) -> tuple[str, str | None]:
+    """The model's answer text and finish_reason from a chat completions body.
+
+    Foundry answers HTTP 200 with a stock refusal when the content filter
+    blocks, and with empty content when reasoning used up max_tokens. Neither
+    is the model's answer, so both raise with a readable reason."""
+    try:
+        choice = body["choices"][0]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise LLMError(f"Unexpected AI Foundry response shape: {str(body)[:300]}") from exc
+
+    finish_reason = choice.get("finish_reason")
+    if finish_reason == "content_filter":
+        flags = [
+            flag for item in body.get("prompt_filter_results") or []
+            if isinstance(item, dict) for flag in _flagged(item.get("content_filter_results"))
+        ] or _flagged(choice.get("content_filter_results"))
+        categories = ", ".join(flags) or "category not reported"
+        logger.error("AI Foundry content filter blocked the request: %s | body: %s", categories, str(body)[:1000])
+        raise LLMError(f"Blocked by the AI Foundry content filter: {categories}.", retryable=False)
+
+    text = _message_text((choice.get("message") or {}).get("content"))
+    if not text:
+        if finish_reason == "length":
+            # The same max_tokens will run out again, so retrying only costs tokens.
+            raise LLMError(
+                "AI Foundry returned an empty reply: the model hit max_tokens. Raise MAX_TOKENS.",
+                retryable=False,
+            )
+        logger.warning("AI Foundry returned empty content. Full response: %s", str(body)[:1000])
+        raise LLMError(f"AI Foundry returned an empty reply (finish_reason={finish_reason}).")
+    return text, finish_reason
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Wait the gateway asked for on a 429; Azure sends retry-after-ms as well."""
+    for header, scale in (("retry-after-ms", 0.001), ("retry-after", 1.0)):
+        value = response.headers.get(header)
+        if value:
+            try:
+                return float(value) * scale
+            except ValueError:
+                continue
+    return None
+
+
+def _parse_llm_text(raw: str) -> tuple[dict, LLMExtractionMetadata]:
+    try:
         code_blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
         if code_blocks:
             parsed = json.loads(_strip_trailing_commas(code_blocks[-1]))
@@ -210,16 +291,21 @@ def _normalize_llm_output(response_json: dict) -> tuple[dict, LLMExtractionMetad
 
         raise ValueError("No JSON object found in LLM response text.")
 
-    except (KeyError, json.JSONDecodeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Failed to parse LLM response.",
-        ) from exc
+    except (KeyError, TypeError, json.JSONDecodeError, ValueError) as exc:
+        # The model may format its answer differently next time, so retry.
+        raise LLMError(f"Failed to parse LLM response: {exc}") from exc
 
 
 class LLMClient:
+    """Async client for the AI Foundry chat completions endpoint.
+
+    One pooled httpx client is kept for the app's lifetime so concurrent
+    files reuse TLS connections instead of a new handshake per call; call
+    aclose() on shutdown."""
+
     def __init__(self) -> None:
         self.settings = get_settings()
+        self._http: httpx.AsyncClient | None = None
 
     def _build_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -229,53 +315,87 @@ class LLMClient:
             headers["X-PBAI-Helper-Id"] = self.settings.helper_id
         return headers
 
-    async def extract_fields(
-        self,
-        prompt: str,
-        stop: list[str] | None = None,
-        timeout: float | None = None,
-    ) -> tuple[dict, LLMExtractionMetadata]:
-        payload = {
+    def _client(self) -> httpx.AsyncClient:
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(
+                headers=self._build_headers(),
+                timeout=self.settings.llm_timeout_seconds,
+                verify=self.settings.llm_verify_ssl,
+                limits=httpx.Limits(max_connections=self.settings.llm_max_concurrent),
+            )
+        return self._http
+
+    async def aclose(self) -> None:
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None
+
+    def _build_payload(self, prompt: str) -> dict:
+        # No temperature or stop: gpt-6-luna is a reasoning model and Foundry
+        # rejects both. The parser below copes with any extra text instead.
+        return {
             "model": self.settings.llm_model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": self.settings.max_tokens,
-            "temperature": 0.3,
             "stream": False,
         }
-        if stop:
-            payload["stop"] = stop
 
+    async def extract_fields(
+        self,
+        prompt: str,
+        timeout: float | None = None,
+    ) -> tuple[dict, LLMExtractionMetadata]:
+        url = self.settings.llm_url
         logger.debug("Prompt length: %d characters", len(prompt))
-        logger.debug("Calling LLM microservice at %s", self.settings.llm_url)
+        logger.debug("Calling AI Foundry at %s (model=%s)", url, self.settings.llm_model_name)
 
+        t0 = time.perf_counter()
         try:
-            t0 = time.perf_counter()
-            effective_timeout = timeout if timeout is not None else self.settings.llm_timeout_seconds
-            async with httpx.AsyncClient(timeout=effective_timeout, verify=False) as client:
-                response = await client.post(
-                    self.settings.llm_url,
-                    headers=self._build_headers(),
-                    json=payload,
-                )
-            elapsed_ms = int((time.perf_counter() - t0) * 1000)
-            response.raise_for_status()
+            response = await self._client().post(
+                url,
+                json=self._build_payload(prompt),
+                timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT,
+            )
+        except httpx.TimeoutException as exc:
+            raise LLMError(f"AI Foundry timed out after {time.perf_counter() - t0:.0f}s.") from exc
+        except httpx.RequestError as exc:
+            raise LLMError(f"Unable to reach AI Foundry at {url}: {type(exc).__name__}: {exc}") from exc
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
-            logger.debug(
-                "LLM HTTP call completed: status=%d, duration=%dms, response_length=%d chars",
-                response.status_code,
-                elapsed_ms,
-                len(response.text),
+        if response.is_error:
+            status = response.status_code
+            # Foundry explains 4xx errors in the body (bad parameter, unknown helper id, rate limit).
+            logger.error("AI Foundry HTTP %d in %dms, body: %s", status, elapsed_ms, response.text[:1000])
+            raise LLMError(
+                f"AI Foundry returned HTTP {status}: {response.text[:300]}",
+                retryable=status in _RETRYABLE_STATUS or status >= 500,
+                status_code=status,
+                retry_after=_retry_after_seconds(response) if status == 429 else None,
             )
 
-            result, metadata = _normalize_llm_output(response.json())
-            metadata.http_duration_ms = elapsed_ms
-            metadata.status_code = response.status_code
-            metadata.response_length_chars = len(response.text)
-            return result, metadata
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise LLMError(f"AI Foundry returned a non-JSON body: {response.text[:300]}") from exc
 
-        except httpx.TimeoutException as exc:
-            raise HTTPException(status_code=504, detail="LLM microservice timed out.") from exc
-        except httpx.HTTPStatusError as exc:
-            raise HTTPException(status_code=502, detail=f"LLM microservice error: HTTP {exc.response.status_code}") from exc
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=502, detail="Unable to connect to LLM microservice.") from exc
+        usage = body.get("usage") or {}
+        text, finish_reason = _reply_text(body)
+        logger.debug(
+            "AI Foundry call completed: status=%d, duration=%dms, finish_reason=%s, tokens(prompt=%s, completion=%s)",
+            response.status_code, elapsed_ms, finish_reason,
+            usage.get("prompt_tokens", "?"), usage.get("completion_tokens", "?"),
+        )
+
+        result, metadata = _parse_llm_text(text)
+        metadata.http_duration_ms = elapsed_ms
+        metadata.status_code = response.status_code
+        metadata.response_length_chars = len(response.text)
+        metadata.finish_reason = finish_reason
+        metadata.prompt_tokens = usage.get("prompt_tokens")
+        metadata.completion_tokens = usage.get("completion_tokens")
+        return result, metadata
+
+
+@lru_cache
+def get_llm_client() -> LLMClient:
+    return LLMClient()

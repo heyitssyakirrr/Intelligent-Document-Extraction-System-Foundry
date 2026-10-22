@@ -15,6 +15,7 @@ from FileReader.app.core.config import get_settings
 from FileReader.app.features.extraction import router as extract_router
 from FileReader.app.features.extraction import drain_and_finalize, get_pending_tasks, start_ocr_worker
 from FileReader.app.features.extraction.concurrency import get_ocr_process_pool, shutdown_ocr_process_pool
+from FileReader.app.services.llm_client import get_llm_client
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -32,7 +33,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     logger.info("Starting %s v%s", settings.app_name, settings.app_version)
     logger.info("Environment  : %s (DB2 %s:%s/%s as %s)", settings.server_env, settings.db2_hostname,
                 settings.db2_port, settings.db2_database, settings.db2_uid)
-    logger.info("LLM endpoint : %s", settings.llm_url)
+    logger.info("LLM endpoint : %s (model=%s, max_tokens=%d)", settings.llm_url, settings.llm_model_name,
+                settings.max_tokens)
     logger.info("OCR results  : results/ (in-process PaddleOCR, cleaned up by router.py)")    
     logger.info("Extract API   : POST /extract (max %d in-flight)",settings.extract_max_pending_tasks,)
 
@@ -48,6 +50,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # recovered into failed.csv on the next startup (see lifecycle.py).
     await drain_and_finalize(get_pending_tasks())
     await shutdown_ocr_process_pool()
+    await get_llm_client().aclose()
     logger.info("Shutting down %s", settings.app_name)
 
 

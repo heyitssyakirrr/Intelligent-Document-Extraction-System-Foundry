@@ -33,6 +33,9 @@ class FileProcessingContext:
     llm_response_truncated: bool = False
     llm_keys_present: list[str] = field(default_factory=list)
     llm_keys_missing: list[str] = field(default_factory=list)
+    llm_finish_reason: str | None = None
+    llm_prompt_tokens: int | None = None
+    llm_completion_tokens: int | None = None
     llm_last_error_type: str | None = None
     llm_last_error_message: str | None = None
 

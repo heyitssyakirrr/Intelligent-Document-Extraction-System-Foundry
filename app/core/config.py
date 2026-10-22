@@ -13,18 +13,22 @@ class Settings(BaseSettings):
     server_env: Literal["PROD", "UAT"]
 
     # ---------------------------------------------------------------------------
-    # LLM microservice configuration
+    # LLM (AI Foundry, OpenAI-compatible chat completions) configuration
     # ---------------------------------------------------------------------------
     llm_base_url: str = ""
-    llm_extract_endpoint: str = ""
+    llm_extract_endpoint: str = "/foundry/chat/completions"
     llm_timeout_seconds: float = 600.0
-    llm_max_concurrent: int = 3             # matches pod count, controls semaphore
+    llm_max_concurrent: int = 3             # simultaneous Foundry calls; keep within the deployment's rate limit
     llm_max_retries: int = 2                # retries per file before marking error
     llm_retry_base_backoff: float = 2.0     # seconds, doubles each retry
-    llm_api_key: str | None = None
-    llm_model_name: str = ""
+    llm_retry_max_wait: float = 60.0        # cap on a 429 Retry-After wait, seconds
+    llm_api_key: str | None = None          # gateway authenticates by helper_id; leave empty unless told otherwise
+    llm_model_name: str = "gpt-6-luna"
+    llm_verify_ssl: bool = False            # kept off as before; turn on once the gateway's CA is trusted
     helper_id: str = ""
-    max_tokens: int = 2048
+    # gpt-6-luna reasons before answering and that reasoning counts against
+    # max_tokens; too low a value returns an empty reply (finish_reason=length).
+    max_tokens: int = 6000
 
     # ---------------------------------------------------------------------------
     # DB2 (ELDS) connection — values come from .env / environment, never code
@@ -88,6 +92,12 @@ class Settings(BaseSettings):
     @classmethod
     def _strip_trailing_slash(cls, v: str) -> str:
         return v.rstrip("/")
+
+    @field_validator("helper_id")
+    @classmethod
+    def _strip_helper_id(cls, v: str) -> str:
+        # a stray space or Windows line ending makes the header illegal
+        return v.strip()
 
     @field_validator("llm_timeout_seconds")
     @classmethod

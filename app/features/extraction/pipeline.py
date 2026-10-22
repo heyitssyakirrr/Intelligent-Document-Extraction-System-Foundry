@@ -29,13 +29,13 @@ from FileReader.app.features.extraction.storage import append_failure_row, appen
 from FileReader.app.features.extraction.summary_logs import append_file_summary
 from FileReader.app.features.prompt import build_extraction_prompt
 from FileReader.app.models.schemas import ExtractionResult
-from FileReader.app.services.llm_client import LLMClient
+from FileReader.app.services.llm_client import LLMError, get_llm_client
 from FileReader.app.services.paddle_ocr import process_pdf
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-_llm_client = LLMClient()
+_llm_client = get_llm_client()
 
 
 def _error_message(exc: Exception) -> str:
@@ -132,15 +132,7 @@ async def _run_llm_extraction(ctx: FileProcessingContext, ocr_text: str) -> Extr
     prompt = build_extraction_prompt(ocr_text)
     ctx.llm_prompt_length_chars = len(prompt)
 
-    llm_result, metadata = await _llm_client.extract_fields(
-        prompt,
-        stop=[
-            "} {", "\n} {", "\n}{", "}\n{", "}\r\n{",
-            "}\n\n", "}\r\n\r\n", "}\n ", "} \n",
-            "}\n#", "}\n`", "\n}\n ", "\n}\n#",
-            "\n}\n`", "\n}\n\n", "\n}\r\n\r\n",
-        ],
-    )
+    llm_result, metadata = await _llm_client.extract_fields(prompt)
 
     ctx.llm_http_duration_ms = metadata.http_duration_ms
     ctx.llm_status_code = metadata.status_code
@@ -150,6 +142,9 @@ async def _run_llm_extraction(ctx: FileProcessingContext, ocr_text: str) -> Extr
     ctx.llm_response_truncated = metadata.response_truncated
     ctx.llm_keys_present = metadata.keys_present or []
     ctx.llm_keys_missing = metadata.keys_missing or []
+    ctx.llm_finish_reason = metadata.finish_reason
+    ctx.llm_prompt_tokens = metadata.prompt_tokens
+    ctx.llm_completion_tokens = metadata.completion_tokens
 
     return ExtractionResult(
         name=llm_result.get("name"),
@@ -208,6 +203,9 @@ async def _llm_stage_inner(ctx: FileProcessingContext, ocr_text: str, pdf_bytes:
             backoff = settings.llm_retry_base_backoff * (2 ** (attempt - 1))
             jitter = random.uniform(0.0, 1.0)
             wait = backoff + jitter
+            if isinstance(last_exc, LLMError) and last_exc.retry_after:
+                # Rate limited: wait as long as the gateway asked, within reason.
+                wait = max(wait, min(last_exc.retry_after, settings.llm_retry_max_wait))
             logger.warning(
                 "LLM retry %d/%d for '%s' (run=%s) - sleeping %.1fs",
                 attempt,
@@ -241,6 +239,9 @@ async def _llm_stage_inner(ctx: FileProcessingContext, ocr_text: str, pdf_bytes:
                     ctx.processing_timestamp,
                     _error_message(exc),
                 )
+                if isinstance(exc, LLMError) and not exc.retryable:
+                    # e.g. content filter, bad request, wrong helper id: same result every time.
+                    break
                 continue
 
         ctx.llm_status = "succeeded"
@@ -278,7 +279,7 @@ async def _llm_stage_inner(ctx: FileProcessingContext, ocr_text: str, pdf_bytes:
             )
         return
 
-    msg = f"LLM failed after {total_attempts} attempt(s): {_error_message(last_exc) if last_exc else 'unknown error'}"
+    msg = f"LLM failed after {ctx.llm_attempts} attempt(s): {_error_message(last_exc) if last_exc else 'unknown error'}"
     ctx.llm_status = "permanently_failed"
     ctx.llm_duration_ms = int((time.perf_counter() - llm_started) * 1000)
     logger.error("LLM permanently failed for '%s' (run=%s): %s", ctx.filename, ctx.processing_timestamp, msg)
