@@ -178,6 +178,8 @@ async def _llm_stage_inner(ctx: FileProcessingContext, pdf_bytes: bytes) -> None
                 last_exc = exc
                 ctx.llm_last_error_type = type(exc).__name__
                 ctx.llm_last_error_message = _error_message(exc)
+                if isinstance(exc, LLMError) and exc.status_code is not None:
+                    ctx.llm_status_code = exc.status_code
                 logger.warning(
                     "LLM attempt %d/%d failed for '%s' (run=%s): %s",
                     attempt + 1,

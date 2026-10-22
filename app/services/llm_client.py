@@ -338,6 +338,9 @@ class LLMClient:
         # No temperature or stop: gpt-6-luna is a reasoning model and Foundry
         # rejects both. The parser below copes with any extra text instead.
         data_url = "data:application/pdf;base64," + base64.b64encode(pdf_bytes).decode("ascii")
+        # The gateway converts chat messages to the Responses API: it maps "text"
+        # parts itself but rejects the chat-style {"type": "file", "file": {...}},
+        # so the PDF goes in the Responses API's own flat input_file shape.
         return {
             "model": self.settings.llm_model_name,
             "messages": [
@@ -346,7 +349,7 @@ class LLMClient:
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "Extract the five fields from the attached document."},
-                        {"type": "file", "file": {"filename": "document.pdf", "file_data": data_url}},
+                        {"type": "input_file", "filename": "document.pdf", "file_data": data_url},
                     ],
                 },
             ],
@@ -384,7 +387,8 @@ class LLMClient:
             # Foundry explains 4xx errors in the body (bad parameter, unknown helper id, rate limit).
             logger.error("AI Foundry HTTP %d in %dms, body: %s", status, elapsed_ms, response.text[:1000])
             raise LLMError(
-                f"AI Foundry returned HTTP {status}: {response.text[:300]}",
+                # one line, so it reads cleanly in failed.csv and the summary box
+                f"AI Foundry returned HTTP {status}: {' '.join(response.text.split())[:400]}",
                 retryable=status in _RETRYABLE_STATUS or status >= 500,
                 status_code=status,
                 retry_after=_retry_after_seconds(response) if status == 429 else None,
