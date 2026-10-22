@@ -4,33 +4,22 @@ import asyncio
 import logging
 import random
 import re
-import tempfile
 import time
-from concurrent.futures import BrokenExecutor
 from datetime import datetime
-from pathlib import Path
 
 from FileReaderv2.app.core.config import get_settings
-from FileReaderv2.app.features.extraction.concurrency import (
-    _llm_semaphore,
-    _ocr_queue,
-    _track_task,
-    get_ocr_process_pool,
-    reset_broken_ocr_pool,
-)
+from FileReaderv2.app.features.extraction.concurrency import _llm_semaphore, _track_task
 from FileReaderv2.app.features.extraction.context import FileProcessingContext
 from FileReaderv2.app.features.extraction.lifecycle import (
-    mark_ocr_complete,
     mark_terminal,
     recover_orphaned_files,
     resume_interrupted_files,
 )
-from FileReaderv2.app.features.extraction.storage import append_failure_row, append_success_row, append_ocr_output
+from FileReaderv2.app.features.extraction.storage import append_failure_row, append_success_row
 from FileReaderv2.app.features.extraction.summary_logs import append_file_summary
-from FileReaderv2.app.features.prompt import build_extraction_prompt
+from FileReaderv2.app.features.prompt import EXTRACTION_INSTRUCTIONS
 from FileReaderv2.app.models.schemas import ExtractionResult
 from FileReaderv2.app.services.llm_client import LLMError, get_llm_client
-from FileReaderv2.app.services.paddle_ocr import process_pdf
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -87,52 +76,10 @@ async def _record_failure(
         )
 
 
-async def _run_ocr(ctx: FileProcessingContext, pdf_bytes: bytes) -> str:
-    suffix = Path(ctx.filename).suffix or ".pdf"
-    tmp_path: Path | None = None
-    started = time.perf_counter()
-    ctx.ocr_status = "running"
+async def _run_llm_extraction(ctx: FileProcessingContext, pdf_bytes: bytes) -> ExtractionResult:
+    ctx.llm_prompt_length_chars = len(EXTRACTION_INSTRUCTIONS)
 
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(pdf_bytes)
-            tmp_path = Path(tmp.name)
-
-        loop = asyncio.get_running_loop()
-        try:
-            text: str = await asyncio.wait_for(
-                loop.run_in_executor(get_ocr_process_pool(), process_pdf, str(tmp_path)),
-                timeout=settings.ocr_timeout_seconds,
-            )
-        except BrokenExecutor:
-            logger.error(
-                "OCR worker process crashed while processing '%s' (run=%s).",
-                ctx.filename, ctx.processing_timestamp,
-            )
-            reset_broken_ocr_pool()
-            raise
-
-        ctx.ocr_duration_ms = int((time.perf_counter() - started) * 1000)
-        ctx.ocr_char_count = len(text)
-        ctx.ocr_status = "completed"
-        logger.debug(
-            "OCR completed for '%s' (run=%s): %d characters extracted",
-            ctx.filename,
-            ctx.processing_timestamp,
-            len(text),
-        )
-        return text
-
-    finally:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
-
-
-async def _run_llm_extraction(ctx: FileProcessingContext, ocr_text: str) -> ExtractionResult:
-    prompt = build_extraction_prompt(ocr_text)
-    ctx.llm_prompt_length_chars = len(prompt)
-
-    llm_result, metadata = await _llm_client.extract_fields(prompt)
+    llm_result, metadata = await _llm_client.extract_fields(EXTRACTION_INSTRUCTIONS, pdf_bytes)
 
     ctx.llm_http_duration_ms = metadata.http_duration_ms
     ctx.llm_status_code = metadata.status_code
@@ -155,9 +102,9 @@ async def _run_llm_extraction(ctx: FileProcessingContext, ocr_text: str) -> Extr
     )
 
 
-async def _llm_stage(ctx: FileProcessingContext, ocr_text: str, pdf_bytes: bytes) -> None:
+async def _llm_stage(ctx: FileProcessingContext, pdf_bytes: bytes) -> None:
     try:
-        await _llm_stage_inner(ctx, ocr_text, pdf_bytes)
+        await _llm_stage_inner(ctx, pdf_bytes)
     except Exception as exc:
         logger.error(
             "Unexpected crash in _llm_stage for '%s' (run=%s): %s",
@@ -190,7 +137,7 @@ async def _llm_stage(ctx: FileProcessingContext, ocr_text: str, pdf_bytes: bytes
     # (success or anticipated failure) on every normal return path.
 
 
-async def _llm_stage_inner(ctx: FileProcessingContext, ocr_text: str, pdf_bytes: bytes) -> None:
+async def _llm_stage_inner(ctx: FileProcessingContext, pdf_bytes: bytes) -> None:
     last_exc: Exception | None = None
     total_attempts = settings.llm_max_retries + 1
     ctx.llm_status = "running"
@@ -225,7 +172,7 @@ async def _llm_stage_inner(ctx: FileProcessingContext, ocr_text: str, pdf_bytes:
                 total_attempts,
             )
             try:
-                result = await _run_llm_extraction(ctx, ocr_text)
+                result = await _run_llm_extraction(ctx, pdf_bytes)
                 _validate_account_fields(result)
             except Exception as exc:
                 last_exc = exc
@@ -286,64 +233,15 @@ async def _llm_stage_inner(ctx: FileProcessingContext, ocr_text: str, pdf_bytes:
     await _record_failure(ctx, pdf_bytes, "llm", msg)
 
 
-async def _ocr_worker() -> None:
-    while True:
-        ctx, pdf_bytes = await _ocr_queue.get()
-        logger.info("OCR worker picked up '%s' (run=%s)", ctx.filename, ctx.processing_timestamp)
-
-        try:
-            ocr_text = await _run_ocr(ctx, pdf_bytes)
-
-        except asyncio.TimeoutError:
-            msg = f"OCR timed out after {settings.ocr_timeout_seconds}s"
-            ctx.ocr_status = "timeout"
-            ctx.ocr_error_type = "TimeoutError"
-            ctx.ocr_error_message = msg
-            logger.error("OCR timeout for '%s' (run=%s): %s", ctx.filename, ctx.processing_timestamp, msg)
-            await _record_failure(ctx, pdf_bytes, "ocr", msg)
-            _ocr_queue.task_done()
-            continue
-
-        except Exception as exc:
-            msg = f"OCR failed: {exc}"
-            ctx.ocr_status = "failed"
-            ctx.ocr_error_type = type(exc).__name__
-            ctx.ocr_error_message = str(exc)
-            logger.error("OCR error for '%s' (run=%s): %s", ctx.filename, ctx.processing_timestamp, exc, exc_info=True)
-            await _record_failure(ctx, pdf_bytes, "ocr", msg)
-            _ocr_queue.task_done()
-            continue
-
-        if not ocr_text or not ocr_text.strip():
-            msg = "OCR returned empty text - no content extracted from PDF"
-            ctx.ocr_status = "empty"
-            ctx.ocr_error_type = "EmptyOCROutput"
-            ctx.ocr_error_message = msg
-            logger.warning("Empty OCR output for '%s' (run=%s)", ctx.filename, ctx.processing_timestamp)
-            await _record_failure(ctx, pdf_bytes, "ocr", msg)
-            _ocr_queue.task_done()
-            continue
-
-        try:
-            ocr_output_path = await append_ocr_output(ocr_text, ctx.filename, ctx.processing_timestamp)
-            ctx.ocr_output_path = str(ocr_output_path)
-            if ctx.intake_id:
-                await mark_ocr_complete(ctx.intake_id, str(ocr_output_path))
-        except Exception as exc:
-            logger.warning("Failed to persist OCR output for '%s' (run=%s): %s", ctx.filename, ctx.processing_timestamp, exc)
-
-        failure_bytes = pdf_bytes
-        pdf_bytes = None
-
-        task = asyncio.create_task(
-            _llm_stage(ctx, ocr_text, failure_bytes),
-            name=f"llm_stage:{ctx.filename}:{ctx.processing_timestamp}",
-        )
-        _track_task(task)
-        _ocr_queue.task_done()
-
-
-_ocr_worker_task: asyncio.Task | None = None
+def submit_for_extraction(ctx: FileProcessingContext, pdf_bytes: bytes) -> None:
+    """Start one file's extraction in the background. Each file is its own
+    task; _llm_semaphore caps how many call Foundry at once, and a task
+    waiting out a retry backoff does not hold a slot."""
+    task = asyncio.create_task(
+        _llm_stage(ctx, pdf_bytes),
+        name=f"llm_stage:{ctx.filename}:{ctx.processing_timestamp}",
+    )
+    _track_task(task)
 
 
 async def _recovery_record_failure(
@@ -389,22 +287,10 @@ async def _recovery_record_failure(
         )
 
 
-async def _requeue_for_ocr(ctx: FileProcessingContext, pdf_bytes: bytes) -> None:
-    await _ocr_queue.put((ctx, pdf_bytes))
-
-
-async def _requeue_for_llm(ctx: FileProcessingContext, ocr_text: str, pdf_bytes: bytes) -> None:
-    task = asyncio.create_task(
-        _llm_stage(ctx, ocr_text, pdf_bytes),
-        name=f"llm_stage:resumed:{ctx.filename}:{ctx.processing_timestamp}",
-    )
-    _track_task(task)
-
-
-async def start_ocr_worker() -> None:
-    global _ocr_worker_task
-
-    resumed_intake_ids = await resume_interrupted_files(_requeue_for_ocr, _requeue_for_llm)
+async def start_extraction_pipeline() -> None:
+    """Hand files left in-flight by a previous run back to extraction, and
+    fail the ones that already had their one resume attempt."""
+    resumed_intake_ids = await resume_interrupted_files(submit_for_extraction)
     if resumed_intake_ids:
         logger.warning(
             "Startup resume: %d file(s) left in-flight by a previous run "
@@ -420,6 +306,3 @@ async def start_ocr_worker() -> None:
             "-- written to failed.csv (stage='resume_failed').",
             recovered_count,
         )
-
-    _ocr_worker_task = asyncio.create_task(_ocr_worker(), name="ocr_worker")
-    logger.info("Single-file OCR worker started.")

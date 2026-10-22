@@ -7,9 +7,10 @@ from fastapi import APIRouter, File, UploadFile
 from fastapi.responses import JSONResponse
 
 from FileReaderv2.app.core.config import get_settings
-from FileReaderv2.app.features.extraction.concurrency import _ocr_queue, pending_task_count
+from FileReaderv2.app.features.extraction.concurrency import pending_task_count
 from FileReaderv2.app.features.extraction.context import FileProcessingContext
 from FileReaderv2.app.features.extraction.lifecycle import register_intake
+from FileReaderv2.app.features.extraction.pipeline import submit_for_extraction
 from FileReaderv2.app.services.file_service import validate_and_read_upload
 
 logger = logging.getLogger(__name__)
@@ -20,7 +21,7 @@ router = APIRouter(prefix="/extract", tags=["Single Extraction"])
 
 @router.post(
     "",
-    summary="Submit & Forget — queue one PDF for background OCR → LLM extraction",
+    summary="Submit & Forget — queue one PDF for background LLM extraction",
     response_class=JSONResponse,
     responses={
         200: {
@@ -76,7 +77,7 @@ async def extract_single(
         processing_timestamp=processing_timestamp,
         received_at=received_at,
         file_size_bytes=len(pdf_bytes),
-        queue_depth_at_upload=_ocr_queue.qsize(),
+        queue_depth_at_upload=pending_task_count(),
         intake_id=intake.intake_id,
     )
 
@@ -87,12 +88,12 @@ async def extract_single(
         len(pdf_bytes),
     )
 
-    await _ocr_queue.put((ctx, pdf_bytes))
+    submit_for_extraction(ctx, pdf_bytes)
     logger.info(
-        "File queued for OCR: '%s' (run=%s, queue size now ~%d)",
+        "File queued for LLM extraction: '%s' (run=%s, in-flight now %d)",
         filename,
         processing_timestamp,
-        _ocr_queue.qsize(),
+        pending_task_count(),
     )
 
     return JSONResponse(

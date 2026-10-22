@@ -9,7 +9,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from FileReaderv2.app.core.config import get_settings
 from FileReaderv2.app.features.extraction.context import FileProcessingContext
@@ -20,7 +20,9 @@ settings = get_settings()
 # ---------------------------------------------------------------------------
 # On-disk layout (all under one root so ops/backup is a single folder)
 # ---------------------------------------------------------------------------
-_LIFECYCLE_ROOT = Path("uploads") / "inflight"
+# Under FileReaderv2/ like results/ and failed/: v1 runs from the same parent
+# folder, and a shared inflight dir would let v2 resume and delete v1's files.
+_LIFECYCLE_ROOT = Path("FileReaderv2", "uploads", "inflight")
 _FILES_DIR = _LIFECYCLE_ROOT / "files"
 _RECORDS_DIR = _LIFECYCLE_ROOT / "records"
 
@@ -133,22 +135,6 @@ async def register_intake(filename: str, processing_timestamp: str, pdf_bytes: b
 
 
 # ---------------------------------------------------------------------------
-# OCR-complete checkpoint (enables resume to skip OCR)
-# ---------------------------------------------------------------------------
-async def mark_ocr_complete(intake_id: str, ocr_output_path: str) -> None:
-    if not intake_id:
-        return
-    try:
-        await _update_record(intake_id, {"ocr_output_path": ocr_output_path})
-    except Exception:
-        logger.warning(
-            "Failed to checkpoint OCR completion for intake_id=%s; if the "
-            "process dies before the LLM stage finishes, this file will "
-            "redo OCR on resume instead of skipping it.", intake_id,
-        )
-
-
-# ---------------------------------------------------------------------------
 # terminal state + cleanup
 # ---------------------------------------------------------------------------
 async def mark_terminal(intake_id: str, filename: str, final_status: str) -> None:
@@ -169,7 +155,9 @@ def _clear_inflight_sync(intake_id: str) -> None:
 # ---------------------------------------------------------------------------
 # resume (re-enter the live pipeline instead of failing outright)
 # ---------------------------------------------------------------------------
-async def resume_interrupted_files(requeue_for_ocr_fn, requeue_for_llm_fn) -> int:
+async def resume_interrupted_files(
+    resubmit_fn: Callable[[FileProcessingContext, bytes], None],
+) -> set[str]:
     loop = asyncio.get_running_loop()
     records = await loop.run_in_executor(None, _read_all_records_sync)
     eligible = [r for r in records if not r.get("resume_attempted")]
@@ -188,7 +176,6 @@ async def resume_interrupted_files(requeue_for_ocr_fn, requeue_for_llm_fn) -> in
         inflight_path = Path(record.get("inflight_path", ""))
         filename = record.get("filename") or inflight_path.name or "unknown.pdf"
         processing_timestamp = record.get("processing_timestamp", "")
-        ocr_output_path_str = record.get("ocr_output_path")
 
         if not inflight_path.exists():
             continue
@@ -223,31 +210,8 @@ async def resume_interrupted_files(requeue_for_ocr_fn, requeue_for_llm_fn) -> in
             intake_id=intake_id,
         )
 
-        if ocr_output_path_str:
-            ocr_output_path = Path(ocr_output_path_str)
-            try:
-                ocr_text = await loop.run_in_executor(None, ocr_output_path.read_text, "utf-8")
-            except OSError:
-                logger.warning(
-                    "OCR checkpoint exists for '%s' (intake_id=%s) but its "
-                    "txt at %s is unreadable; resuming via OCR instead of "
-                    "skipping it.", filename, intake_id, ocr_output_path,
-                )
-                await requeue_for_ocr_fn(ctx, pdf_bytes)
-            else:
-                ctx.ocr_output_path = str(ocr_output_path)
-                logger.info(
-                    "Resuming '%s' (intake_id=%s) directly into the LLM "
-                    "stage using its saved OCR output.", filename, intake_id,
-                )
-                await requeue_for_llm_fn(ctx, ocr_text, pdf_bytes)
-        else:
-            logger.info(
-                "Resuming '%s' (intake_id=%s) via the OCR queue (no saved "
-                "OCR output found).", filename, intake_id,
-            )
-            await requeue_for_ocr_fn(ctx, pdf_bytes)
-                                                                                  
+        logger.info("Resuming '%s' (intake_id=%s) into LLM extraction.", filename, intake_id)
+        resubmit_fn(ctx, pdf_bytes)
         resumed_intake_ids.add(intake_id)
 
     return resumed_intake_ids

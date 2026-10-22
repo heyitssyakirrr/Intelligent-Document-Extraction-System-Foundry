@@ -13,13 +13,6 @@ class FileProcessingContext:
     queue_depth_at_upload: int
     intake_id: str = ""
 
-    ocr_status: str = "pending"
-    ocr_duration_ms: int | None = None
-    ocr_char_count: int | None = None
-    ocr_error_type: str | None = None
-    ocr_error_message: str | None = None
-    ocr_output_path: str | None = None
-
     llm_status: str = "pending"
     llm_attempts: int = 0
     llm_max_attempts: int = 0

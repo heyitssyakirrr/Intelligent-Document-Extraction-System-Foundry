@@ -44,13 +44,6 @@ class Settings(BaseSettings):
     db2_gmsa_principal: str = ""
 
     # ---------------------------------------------------------------------------
-    # PaddleOCR (in-process) configuration
-    # ---------------------------------------------------------------------------
-    ocr_timeout_seconds: float = 300.0
-    # "median" stops consecutive lines merging into one row; "legacy" is the original grouping.
-    ocr_row_grouping: Literal["legacy", "median"] = "legacy"
-
-    # ---------------------------------------------------------------------------
     # Input safety
     # ---------------------------------------------------------------------------
     max_input_characters: int = 50_000
@@ -59,6 +52,8 @@ class Settings(BaseSettings):
     # File upload
     # ---------------------------------------------------------------------------
     allowed_upload_extensions: list[str] = [".pdf"]
+    # The whole PDF is sent to Foundry base64-encoded (about 1.33x its size),
+    # and every page costs input tokens, so keep both limits tight.
     max_upload_bytes: int = 10 * 1024 * 1024  # 10 MB
     max_pdf_pages: int = 6
 
@@ -81,7 +76,7 @@ class Settings(BaseSettings):
     )
 
     # ---------------------------------------------------------------------------
-    # File retention (results / failed / OCR outputs)
+    # File retention (results / failed / summary logs)
     # ---------------------------------------------------------------------------
     retention_max_days: int = 30
 
@@ -104,13 +99,6 @@ class Settings(BaseSettings):
     def _positive_llm_timeout(cls, v: float) -> float:
         if v <= 0:
             raise ValueError("llm_timeout_seconds must be positive")
-        return v
-
-    @field_validator("ocr_timeout_seconds")
-    @classmethod
-    def _positive_ocr_timeout(cls, v: float) -> float:
-        if v <= 0:
-            raise ValueError("ocr_timeout_seconds must be positive")
         return v
 
     @field_validator("max_files_per_batch")

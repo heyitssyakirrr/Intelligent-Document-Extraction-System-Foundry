@@ -30,11 +30,13 @@ _KNOWN_BANKS = """\
 - UOB"""
 
 
-def build_extraction_prompt(text: str) -> str:
-    """Prompt for customer detail extraction."""
-    return f"""\
+# System instructions for customer detail extraction. The document itself is
+# sent alongside as a PDF file part (see llm_client.py), so this text is the
+# same for every file: built once, and cacheable by Foundry as a prompt prefix.
+EXTRACTION_INSTRUCTIONS = f"""\
 You are a data extraction assistant for a Malaysian bank's internal system.
-Your task is to extract exactly five fields from a bank document.
+Your task is to extract exactly five fields from a bank document. The document
+is attached as a PDF, often a scanned letter. Read every page, including tables.
 
 === RULES ===
 0. You are in JSON-only mode. Your entire response must be a single JSON object. Stop immediately after the closing brace. No introduction, no explanation, no conclusion.
@@ -78,12 +80,13 @@ The section ALWAYS lists the three values with these logical roles:
 
 This section appears in ONE OF SIX layouts. Detect which one is present:
 
---- LAYOUT A: pipe/markdown table ---
+--- LAYOUT A: table ---
 All three values appear as cells in a single table row.
 The fi_num is the cell containing EXACTLY 9 digits and starting with 0 or 3,
 regardless of column position. The table header or column order may differ
 between documents. Count the digits — do not judge by position or by which
 cell merely looks shorter.
+(Examples below write table rows as | cell | cell |.)
 Example (fi_num on the right — 9 digits):
     | 71259000031266 | 021812590 |
       ^master_acc      ^fi_num (9 digits, starts with 0)
@@ -94,8 +97,8 @@ Example (fi_num on the left — 9 digits):
 If NO cell in the row has exactly 9 digits, fi_num is null. If only two values
 appear in the table row, there is no sub account — return the value of
 master_account_number for sub_account_number.
-Only "|" separates columns. A "/" inside a header joins two names into ONE
-column — e.g. "Master /Sub account" is a single column meaning master = sub.
+A "/" inside a column header joins two names into ONE column — e.g.
+"Master /Sub account" is a single column meaning master = sub.
 The FI code may appear more than once (e.g. "021810037" and "[021810037");
 every copy is the FI code, never an account number.
 
@@ -176,10 +179,10 @@ Example:
     → sub_account_number = "71435200014492" (same as master, NOT 71435200014506)
     → fi_num = "021814352"
 
---- LAYOUT G: Flat CCRIS table (two raw lines, no structure) ---
-PaddleOCR cannot preserve table columns. A CCRIS table becomes two flat lines:
-  Line 1 (header): contains the words "FI", "Master", "Sub" in left-to-right order
-  Line 2 (values): three numbers separated by spaces on a single line
+--- LAYOUT G: CCRIS table with a header row and one values row ---
+A CCRIS table with no labels beside the values, often without ruled lines:
+  Row 1 (header): contains the words "FI", "Master", "Sub" in left-to-right order
+  Row 2 (values): three numbers side by side, one under each header
 
 The values appear in the SAME LEFT-TO-RIGHT ORDER as their column headers:
   Position 1 (leftmost)  → FI Code           → the 9-digit number
@@ -192,11 +195,11 @@ Use digit COUNT as the authoritative test — do NOT rely on position alone:
   sub_account_number    = the remaining number
 
 CRITICAL: The header labels tell you the column ORDER, not the values.
-The values are on the NEXT line. Never confuse header words with account numbers.
+The values are in the row BELOW. Never confuse header words with account numbers.
 
 Example:
-  Line 1: "FICode Master Act Number Sub Act.Number"
-  Line 2: "034707062 00000060729028921708888001 0000000406070003660"
+  Row 1: "FICode Master Act Number Sub Act.Number"
+  Row 2: "034707062 00000060729028921708888001 0000000406070003660"
   → fi_num                = "034707062"                  (9 digits — exact match)
   → master_account_number = "00000060729028921708888001"  (26 digits — longest)
   → sub_account_number    = "0000000406070003660"         (19 digits — remaining)
@@ -209,7 +212,7 @@ COMMON EXTRACTION MISTAKES — DO NOT REPEAT THESE
 ================================================================================
 These show real LLM errors. Study them to avoid making the same mistake.
 
-MISTAKE 1 — fi_num and master swapped (Layout A pipe table):
+MISTAKE 1 — fi_num and master swapped (Layout A table):
   Document:  | 88820006220322 | 034907013 |
   WRONG:  fi_num="88820006220322"  master="034907013"
   RIGHT:  fi_num="034907013"       master="88820006220322"
@@ -241,8 +244,8 @@ MISTAKE 5 — fi_num starting with 1 (CCRIS layout):
   WRONG:  fi_num="1035312016"
   RIGHT:  fi_num="035312016"  (take the value starting with 0, not 1)
 
-MISTAKE 6 — fi_num and master swapped in Flat CCRIS table (Layout G):
-  Document (two flat lines from OCR):
+MISTAKE 6 — fi_num and master swapped in a CCRIS header/values table (Layout G):
+  Document (header row, then values row):
     "FICode Master Act Number Sub Act.Number"
     "034707062 00000060729028921708888001 0000000406070003660"
   WRONG:  fi_num="00000060729028921708888001"  master="034707062"
@@ -264,16 +267,15 @@ MISTAKE 8 — product description glued onto the account number:
   WRONG:  master="7114160292-00000 Term Loan"
   RIGHT:  master="7114160292-00000"
   Why: "Term Loan" is the facility/product description, not part of the account
-       number. It must be removed together with its brackets, even when OCR
-       leaves no space before the opening bracket. The same applies to
+       number. It must be removed together with its brackets, even when it is
+       printed with no space before the opening bracket. The same applies to
        "(Term Financing-i)", "(Housing Loan)", "[Overdraft]", "- Term Loan",
        "Term Financing-i" and any similar trailing wording.
 
 MISTAKE 9 — FI code reused as the sub account ("/" mistaken for a column):
   Document:  Account(s) : | Master /Sub account | FI CODE* |
              | 71003700011898 | 021810037 |
-  OCR may flatten it into one row, and the FI code may appear twice:
-             | Master /Sub account | 71003700011898 | 021810037 | [021810037 | FICODE* |
+  The FI code may also be printed twice, e.g. "021810037" and "[021810037".
   WRONG:  fi_num="021810037"  master="71003700011898"  sub="021810037"
   RIGHT:  fi_num="021810037"  master="71003700011898"  sub="71003700011898"
   Why: "Master /Sub account" is ONE combined column ("/" is not a column
@@ -308,7 +310,7 @@ MISTAKE 9 — FI code reused as the sub account ("/" mistaken for a column):
   the following, whether or not a space separates them from the number:
     * anything inside brackets: "(Term Loan)", "(Term Financing-i)",
       "(Housing Loan)", "[Overdraft]", "(HL)" — remove the brackets and their
-      contents. OCR often glues them on: "7114160292-00000(Term Loan)".
+      contents. They are often printed with no space: "7114160292-00000(Term Loan)".
     * trailing descriptive words even without brackets, e.g. "Term Loan",
       "Term Financing-i", "Home Financing", "Overdraft", "Loan", "Financing",
       "Facility", "Account", "a/c", "OD", "HL", and anything after a trailing
@@ -330,16 +332,13 @@ MISTAKE 9 — FI code reused as the sub account ("/" mistaken for a column):
   field. Treat any label that starts with "MASTER" and ends with a word meaning
   "ACCOUNT" / "A/C" / "NO" as the master account label, regardless of what
   qualifier word sits in between.
-- PROXIMITY SEARCH FOR SKEWED/MISALIGNED OCR — because the source document is
-  often physically skewed or scanned at an angle, OCR can place the account
-  number's digits on the line immediately ABOVE or BELOW the "Master Account"
-  label instead of directly after it on the same line, even though in the real
-  document they are printed on the same line. If a line consisting ONLY of a
-  long digit/alphanumeric string appears directly before or after a line
-  containing a "MASTER * ACCOUNT" label (with no other label between them),
-  treat that number as belonging to the master account label and use it as
-  master_account_number, even though it is not on the same OCR line.
-  Example (number appears ABOVE the label due to skew):
+- PROXIMITY SEARCH FOR SKEWED SCANS — the source document is often scanned at
+  an angle, so the account number can sit slightly ABOVE or BELOW the "Master
+  Account" label instead of level with it. If a standalone long
+  digit/alphanumeric string sits just above or below a "MASTER * ACCOUNT"
+  label (with no other label between them), it belongs to that label: use it
+  as master_account_number.
+  Example (number sits slightly ABOVE the label due to skew):
       123871298759812
       master account number:
       → master_account_number = "123871298759812"
@@ -431,18 +430,11 @@ Known bank names — return the EXACT canonical form from this list:
 ================================================================================
 O vs 0 DISAMBIGUATION RULE
 ================================================================================
-OCR sometimes renders the letter O as the digit 0. Apply these rules:
+On scanned documents the letter O and the digit 0 can look alike. Apply these rules:
 - Suffixes such as "/D88", "/D66", "/D90" are ALWAYS preceded by the letter O:
     write "O/D88" — NOT "0/D88".
 - Inside a purely numeric sequence with no suffix, treat ambiguous characters as 0.
 - When in doubt at a suffix boundary, use the letter O.
-
-================================================================================
-DOCUMENT
-================================================================================
-\"\"\"
-{text}
-\"\"\"
 
 ================================================================================
 STEP-BY-STEP EXTRACTION CHECKLIST
@@ -457,13 +449,12 @@ STEP 1 — LOCATE THE FI CODE SECTION
   "MASTER * ACCOUNT" / "MASTER * A/C" / "MASTER * NO" rather than an exact
   phrase — the middle word varies ("MASTER FIN ACCOUNT NUMBER", "MASTER LOAN
   ACCOUNT NO", etc). If the line with this label has no number on it (or the
-  number looks cut off), do a PROXIMITY SEARCH: check the line immediately
-  above and the line immediately below for a standalone digit/alphanumeric
-  string — skewed scans often cause OCR to place the master account number on
-  an adjacent line even though it is on the same line in the original document.
+  number looks cut off), do a PROXIMITY SEARCH: check just above and just
+  below the label for a standalone digit/alphanumeric string — on skewed scans
+  the master account number can sit slightly off the label's line.
 
 STEP 2 — DETECT THE LAYOUT
-  Pipe characters (|) → Layout A: assign fi_num to the 9-digit value in the row.
+  Values in the cells of one table row → Layout A: assign fi_num to the 9-digit value in the row.
   Label lines (FI CODE :, MASTER ACCOUNT NO :) → Layout B: read each label's value.
   Repeated inline colons with label keywords on one line → Layout C.
   Lettered list (a) / b) / c)) → Layout D: each letter is a separate field;
@@ -474,8 +465,8 @@ STEP 2 — DETECT THE LAYOUT
       share that value; digit after "NO." is a footnote marker, not the sub account.
   "CCRIS" prefix with comma-separated values → Layout F (CCRIS variant): fi_num is
       the 9-digit value starting with 0 or 3 (first value only per line).
-  Header line ("FICode Master Act Number Sub Act.Number") followed by a bare
-      values line with three space-separated numbers → Layout G: assign by digit
+  Header row ("FICode Master Act Number Sub Act.Number") with a row of three
+      unlabelled numbers below it → Layout G: assign by digit
       count: 9-digit=fi_num, longest=master, remaining=sub.
 
 STEP 3 — ASSIGN THE THREE VALUES

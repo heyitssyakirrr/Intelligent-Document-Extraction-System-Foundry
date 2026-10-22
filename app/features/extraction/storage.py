@@ -25,11 +25,9 @@ settings = get_settings()
 
 _RESULTS_ROOT = Path("FileReaderv2","results")
 _FAILED_ROOT = Path("FileReaderv2","failed")
-_OCR_OUTPUTS_ROOT = Path("FileReaderv2","OCR_Outputs")
 
 _RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
 _FAILED_ROOT.mkdir(parents=True, exist_ok=True)
-_OCR_OUTPUTS_ROOT.mkdir(parents=True, exist_ok=True)
 
 _COLUMN_WIDTHS = {
     "timestamp": 20,
@@ -171,41 +169,5 @@ async def append_failure_row(
         filename,
         error_message,
         timestamp,
-        today,
-    )
-
-
-def _write_ocr_output_sync(
-    text: str,
-    filename: str,
-    processing_timestamp: str,
-    today: str,
-) -> Path:
-    day_folder = _OCR_OUTPUTS_ROOT / today
-    day_folder.mkdir(parents=True, exist_ok=True)
-
-    txt_name = f"{Path(filename).stem}_{processing_timestamp}.txt"
-    dest_path = day_folder / txt_name
-    dest_path.write_text(text, encoding="utf-8")
-
-    enforce_dated_folder_retention(_OCR_OUTPUTS_ROOT, settings.retention_max_days)
-
-    logger.info("OCR output written to %s", dest_path)
-    return dest_path
-
-
-async def append_ocr_output(
-    text: str,
-    filename: str,
-    processing_timestamp: str,
-) -> Path:
-    today = datetime.now().strftime("%Y%m%d")
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None,
-        _write_ocr_output_sync,
-        text,
-        filename,
-        processing_timestamp,
         today,
     )

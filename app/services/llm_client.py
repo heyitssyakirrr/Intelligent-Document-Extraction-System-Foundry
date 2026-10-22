@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -330,30 +331,46 @@ class LLMClient:
             await self._http.aclose()
             self._http = None
 
-    def _build_payload(self, prompt: str) -> dict:
+    def _build_payload(self, instructions: str, pdf_bytes: bytes) -> dict:
+        # Instructions go first, as a system message identical for every file,
+        # so Foundry can cache that prefix; the PDF follows as a file part.
+        # The real filename is not sent: it can carry customer details.
         # No temperature or stop: gpt-6-luna is a reasoning model and Foundry
         # rejects both. The parser below copes with any extra text instead.
+        data_url = "data:application/pdf;base64," + base64.b64encode(pdf_bytes).decode("ascii")
         return {
             "model": self.settings.llm_model_name,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [
+                {"role": "system", "content": instructions},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Extract the five fields from the attached document."},
+                        {"type": "file", "file": {"filename": "document.pdf", "file_data": data_url}},
+                    ],
+                },
+            ],
             "max_tokens": self.settings.max_tokens,
             "stream": False,
         }
 
     async def extract_fields(
         self,
-        prompt: str,
+        instructions: str,
+        pdf_bytes: bytes,
         timeout: float | None = None,
     ) -> tuple[dict, LLMExtractionMetadata]:
         url = self.settings.llm_url
-        logger.debug("Prompt length: %d characters", len(prompt))
-        logger.debug("Calling AI Foundry at %s (model=%s)", url, self.settings.llm_model_name)
+        logger.debug(
+            "Calling AI Foundry at %s (model=%s, instructions=%d chars, pdf=%d bytes)",
+            url, self.settings.llm_model_name, len(instructions), len(pdf_bytes),
+        )
 
         t0 = time.perf_counter()
         try:
             response = await self._client().post(
                 url,
-                json=self._build_payload(prompt),
+                json=self._build_payload(instructions, pdf_bytes),
                 timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT,
             )
         except httpx.TimeoutException as exc:
