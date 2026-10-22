@@ -8,7 +8,7 @@ import logging
 import math
 from pathlib import Path
 
-from FileReader.app.core.config import get_settings
+from FileReaderv2.app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 

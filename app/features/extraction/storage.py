@@ -5,27 +5,27 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-from FileReader.app.core.config import get_settings
-from FileReader.app.features.extraction.concurrency import _csv_append_lock
-from FileReader.app.features.extraction.retention import (
+from FileReaderv2.app.core.config import get_settings
+from FileReaderv2.app.features.extraction.concurrency import _csv_append_lock
+from FileReaderv2.app.features.extraction.retention import (
     enforce_dated_folder_retention,
     enforce_extractions_retention,
 )
-from FileReader.app.models.schemas import ExtractionResult
-from FileReader.app.services.db2_luw_client import (
+from FileReaderv2.app.models.schemas import ExtractionResult
+from FileReaderv2.app.services.db2_luw_client import (
     append_filereader_row,
     connect_db2,
     connect_db2_gmsa,
     kinit_from_keytab,
 )
-from FileReader.app.services.password_decryptor import decrypt_password
+from FileReaderv2.app.services.password_decryptor import decrypt_password
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-_RESULTS_ROOT = Path("FileReader","results")
-_FAILED_ROOT = Path("FileReader","failed")
-_OCR_OUTPUTS_ROOT = Path("FileReader","OCR_Outputs")
+_RESULTS_ROOT = Path("FileReaderv2","results")
+_FAILED_ROOT = Path("FileReaderv2","failed")
+_OCR_OUTPUTS_ROOT = Path("FileReaderv2","OCR_Outputs")
 
 _RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
 _FAILED_ROOT.mkdir(parents=True, exist_ok=True)

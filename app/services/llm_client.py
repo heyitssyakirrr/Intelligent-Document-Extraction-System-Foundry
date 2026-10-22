@@ -9,7 +9,7 @@ from functools import lru_cache
 
 import httpx
 
-from FileReader.app.core.config import get_settings
+from FileReaderv2.app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 

@@ -10,27 +10,27 @@ from concurrent.futures import BrokenExecutor
 from datetime import datetime
 from pathlib import Path
 
-from FileReader.app.core.config import get_settings
-from FileReader.app.features.extraction.concurrency import (
+from FileReaderv2.app.core.config import get_settings
+from FileReaderv2.app.features.extraction.concurrency import (
     _llm_semaphore,
     _ocr_queue,
     _track_task,
     get_ocr_process_pool,
     reset_broken_ocr_pool,
 )
-from FileReader.app.features.extraction.context import FileProcessingContext
-from FileReader.app.features.extraction.lifecycle import (
+from FileReaderv2.app.features.extraction.context import FileProcessingContext
+from FileReaderv2.app.features.extraction.lifecycle import (
     mark_ocr_complete,
     mark_terminal,
     recover_orphaned_files,
     resume_interrupted_files,
 )
-from FileReader.app.features.extraction.storage import append_failure_row, append_success_row, append_ocr_output
-from FileReader.app.features.extraction.summary_logs import append_file_summary
-from FileReader.app.features.prompt import build_extraction_prompt
-from FileReader.app.models.schemas import ExtractionResult
-from FileReader.app.services.llm_client import LLMError, get_llm_client
-from FileReader.app.services.paddle_ocr import process_pdf
+from FileReaderv2.app.features.extraction.storage import append_failure_row, append_success_row, append_ocr_output
+from FileReaderv2.app.features.extraction.summary_logs import append_file_summary
+from FileReaderv2.app.features.prompt import build_extraction_prompt
+from FileReaderv2.app.models.schemas import ExtractionResult
+from FileReaderv2.app.services.llm_client import LLMError, get_llm_client
+from FileReaderv2.app.services.paddle_ocr import process_pdf
 
 logger = logging.getLogger(__name__)
 settings = get_settings()

@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     extract_shutdown_drain_seconds: float = 30.0
 
     model_config = SettingsConfigDict(
-        env_file="FileReader/.env",
+        env_file="FileReaderv2/.env",
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore"
@@ -161,6 +161,6 @@ def get_settings() -> Settings:
         raise RuntimeError(f"SERVER_ENV must be one of {_SERVER_ENVS}, got {server_env}")
     # Later files override earlier ones: shared .env first, then .env.prod / .env.uat.
     return Settings(
-        _env_file=("FileReader/.env", f"FileReader/.env.{server_env.lower()}"),
+        _env_file=("FileReaderv2/.env", f"FileReaderv2/.env.{server_env.lower()}"),
         server_env=server_env,
     )

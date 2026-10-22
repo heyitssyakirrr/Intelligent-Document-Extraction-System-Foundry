@@ -11,11 +11,11 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from FileReader.app.core.config import get_settings
-from FileReader.app.features.extraction import router as extract_router
-from FileReader.app.features.extraction import drain_and_finalize, get_pending_tasks, start_ocr_worker
-from FileReader.app.features.extraction.concurrency import get_ocr_process_pool, shutdown_ocr_process_pool
-from FileReader.app.services.llm_client import get_llm_client
+from FileReaderv2.app.core.config import get_settings
+from FileReaderv2.app.features.extraction import router as extract_router
+from FileReaderv2.app.features.extraction import drain_and_finalize, get_pending_tasks, start_ocr_worker
+from FileReaderv2.app.features.extraction.concurrency import get_ocr_process_pool, shutdown_ocr_process_pool
+from FileReaderv2.app.services.llm_client import get_llm_client
 
 logging.basicConfig(
     level=logging.DEBUG,

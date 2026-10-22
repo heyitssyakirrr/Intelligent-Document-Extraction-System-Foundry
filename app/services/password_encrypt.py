@@ -27,14 +27,14 @@ def encrypt_password():
     encrypted_password = base64.urlsafe_b64encode(encrypted_data)
 
     # create directory if not exist
-    os.makedirs("FileReader/PasswordKey/", exist_ok=True)
+    os.makedirs("FileReaderv2/PasswordKey/", exist_ok=True)
     # Save the encrypted password
-    encrypted_password_path = f"FileReader/PasswordKey/encrypted_{password_name}_password.parquet"
+    encrypted_password_path = f"FileReaderv2/PasswordKey/encrypted_{password_name}_password.parquet"
     df = pd.DataFrame({"Encrypted_Password": [encrypted_password]})
     df.to_parquet(encrypted_password_path)
 
     # Save the key (in a real application, protect this carefully!)
-    key_file_path = f"FileReader/PasswordKey/encrypted_{password_name}_password_key.key"
+    key_file_path = f"FileReaderv2/PasswordKey/encrypted_{password_name}_password_key.key"
     with open(key_file_path, "wb") as key_file:
         key_file.write(key)
 

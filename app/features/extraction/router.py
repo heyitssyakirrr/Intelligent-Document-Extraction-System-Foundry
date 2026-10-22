@@ -6,11 +6,11 @@ from datetime import datetime
 from fastapi import APIRouter, File, UploadFile
 from fastapi.responses import JSONResponse
 
-from FileReader.app.core.config import get_settings
-from FileReader.app.features.extraction.concurrency import _ocr_queue, pending_task_count
-from FileReader.app.features.extraction.context import FileProcessingContext
-from FileReader.app.features.extraction.lifecycle import register_intake
-from FileReader.app.services.file_service import validate_and_read_upload
+from FileReaderv2.app.core.config import get_settings
+from FileReaderv2.app.features.extraction.concurrency import _ocr_queue, pending_task_count
+from FileReaderv2.app.features.extraction.context import FileProcessingContext
+from FileReaderv2.app.features.extraction.lifecycle import register_intake
+from FileReaderv2.app.services.file_service import validate_and_read_upload
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
